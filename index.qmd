@@ -21,6 +21,8 @@ execute:
   message: false
 ---
 
+[qmd link](https://github.com/BSTA-374/space-timePointPattern/blob/main/index.qmd)
+
 ## The point of this session
 
 Last class we asked whether a pattern was clustered. Today: whether it is
