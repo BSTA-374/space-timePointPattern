@@ -1,0 +1,530 @@
+---
+title: "In-Class: Space-Time Point Patterns"
+subtitle: "BSTA 374 · Week 4 · 50 minutes · KDE slices, volume rendering, Knox and linked pairs"
+author: "Eric M. Delmelle · Lehigh University"
+date: last-modified
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "On this page"
+    number-sections: false
+    code-fold: show
+    code-copy: true
+    highlight-style: github
+    fig-align: center
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## The point of this session
+
+Last class we asked whether a pattern was clustered. Today: whether it is
+clustered *in time as well*, which is a different question with a different
+answer and a different operational meaning.
+
+A dataset pooled over six months hides everything that matters about an
+outbreak. We will look at the same 330 cases six ways, and the six views do not agree ---
+that disagreement is the lesson.
+
+Data: `outbreak_class_sim.csv`, 330 simulated cases over 16 weeks in an
+8 × 8 km study area. **The coordinates are already projected** (EPSG:32618,
+metres), which is common when data come from a health department rather than a
+geocoder.
+
+```{r}
+#| label: setup
+#| code-fold: false
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(spatstat)
+library(plotly)
+
+set.seed(374)
+
+cases <- read.csv("outbreak_class_sim.csv") |>
+  mutate(onset_date = as.Date(onset_date),
+         day  = as.numeric(onset_date - min(onset_date)),
+         week = day %/% 7 + 1)
+
+win <- owin(c(0, 8000), c(0, 8000))
+pp  <- ppp(cases$x_utm, cases$y_utm, window = win)
+
+c(n = npoints(pp), per_km2 = intensity(pp) * 1e6, weeks = max(cases$week))
+```
+
+Note there is no `st_transform()` anywhere: the numbers are metres already. If
+you pass them through `crs = 4326` by reflex you will put this city in the
+Atlantic.
+
+---
+
+## 1. The two marginal views (5 min)
+
+Look at space alone, then time alone. Both are honest; neither is enough.
+
+```{r}
+#| label: marginals
+#| fig-width: 10
+#| fig-height: 4
+
+p1 <- ggplot(cases, aes(x_utm, y_utm)) +
+  geom_point(size = 0.9, alpha = 0.5, colour = "firebrick") +
+  coord_equal() + theme_minimal() +
+  labs(title = "Space, pooled over 16 weeks", x = "x (m)", y = "y (m)")
+
+p2 <- ggplot(cases, aes(week)) +
+  geom_bar(fill = "grey40") + theme_minimal() +
+  labs(title = "Time, pooled over the whole area", x = "week", y = "cases")
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+**Question 1.** The map shows a diagonal band of cases and one dense patch. The
+epidemic curve shows a rise and fall. Can you tell from these two plots whether
+the band and the patch were active at the same time? Write one sentence before
+running anything else.
+
+---
+
+## 2. Kernel density, and what the bandwidth decides (8 min)
+
+```{r}
+#| label: kde-bw
+#| fig-width: 10
+#| fig-height: 4
+
+sigmas <- c(200, 600, 1500)
+surf   <- lapply(sigmas, function(s) density(pp, sigma = s, eps = 50) * 1e6)
+zmax   <- max(sapply(surf, max))
+
+par(mfrow = c(1, 3), mar = c(1, 1, 2, 2))
+for (i in seq_along(surf))
+  plot(surf[[i]], main = paste0("sigma = ", sigmas[i], " m"),
+       zlim = c(0, zmax), ribargs = list(las = 1))
+```
+
+Same data, same colour scale, three bandwidths. At 200 m the surface resolves
+individual cases; at 1500 m the band and the patch merge into one blur. The
+automatic selectors disagree with each other by design:
+
+```{r}
+#| label: selectors
+#| code-fold: false
+
+c(diggle = bw.diggle(pp), ppl = bw.ppl(pp), scott = mean(bw.scott(pp)))
+```
+
+**Question 2.** Which of the three surfaces would you put in front of a health
+officer, and what would you tell them it does *not* show?
+
+---
+
+## 3. The same KDE, one slice per fortnight (8 min)
+
+One bandwidth, one colour scale, eight time slices. This is a space-time kernel
+estimate with the temporal smoothing done crudely --- a hard cut every two weeks.
+
+```{r}
+#| label: slices
+#| fig-width: 11
+#| fig-height: 6
+
+cases$fortnight <- (cases$week - 1) %/% 2 + 1
+labs <- paste("weeks", (sort(unique(cases$fortnight)) - 1) * 2 + 1, "-",
+              sort(unique(cases$fortnight)) * 2)
+
+slices <- lapply(sort(unique(cases$fortnight)), function(f) {
+  sub <- cases[cases$fortnight == f, ]
+  density(ppp(sub$x_utm, sub$y_utm, window = win), sigma = 600, eps = 50) * 1e6
+})
+zmax <- max(sapply(slices, max))
+
+par(mfrow = c(2, 4), mar = c(1, 1, 2, 2))
+for (i in seq_along(slices))
+  plot(slices[[i]], main = labs[i], zlim = c(0, zmax), ribargs = list(las = 1))
+```
+
+Now the pooled map falls apart. The band was never a band: it is one hotspot in
+different places at different times. The dense patch, by contrast, is in every
+panel.
+
+```{r}
+#| label: centre-track
+#| fig-width: 5.5
+#| fig-height: 5.5
+
+track <- cases |>
+  group_by(week) |>
+  summarise(x = mean(x_utm), y = mean(y_utm), n = n())
+
+ggplot(track, aes(x, y)) +
+  geom_path(colour = "grey60") +
+  geom_point(aes(size = n, colour = week)) +
+  scale_colour_viridis_c() + coord_equal() + theme_minimal() +
+  labs(title = "Weekly mean centre of cases", x = "x (m)", y = "y (m)")
+```
+
+The mean centre migrates from the southwest to the northeast. It is a crude
+summary --- one point per week, dragged around by the static patch --- but the
+drift is unmistakable.
+
+**Question 3.** Estimate the speed of the moving hotspot in metres per week off
+the track plot or the cube below. What would you need to know about this disease to say whether
+that speed is plausible?
+
+---
+
+## 4. The space-time cube (7 min)
+
+Both marginal views and all eight slices in one object: easting, northing, and
+time on the vertical axis. Rotate it.
+
+```{r}
+#| label: cube
+
+plot_ly(cases, x = ~x_utm, y = ~y_utm, z = ~day,
+        type = "scatter3d", mode = "markers",
+        marker = list(size = 3, opacity = 0.7, color = ~day,
+                      colorscale = "Viridis", showscale = TRUE)) |>
+  layout(scene = list(xaxis = list(title = "x (m)"),
+                      yaxis = list(title = "y (m)"),
+                      zaxis = list(title = "day of study")))
+```
+
+Two structures should be visible once the cube turns: cases climbing diagonally
+through the box, and a knot of cases standing at a fixed location across the full
+height. Points, though, are hard to read through --- the front of the cloud hides
+the back. Section 5 renders the same structure as a surface.
+
+```{r}
+#| label: animation
+
+plot_ly(cases, x = ~x_utm, y = ~y_utm, frame = ~week,
+        type = "scatter", mode = "markers",
+        marker = list(size = 7, color = "firebrick", opacity = 0.75)) |>
+  layout(xaxis = list(title = "x (m)", range = c(0, 8000)),
+         yaxis = list(title = "y (m)", range = c(0, 8000)),
+         title = "Cases by week")
+```
+
+---
+
+## 5. Volume rendering: isosurfaces of the space-time density (8 min)
+
+The scatter cube plots the cases, and points hide each other. What we want is the
+*density* of cases in space-time --- a continuous field over $(x, y, t)$ --- and
+the surfaces that enclose its high values. That is a 3D kernel estimate with two
+bandwidths: `h` in metres and `lam` in days.
+
+```{r}
+#| label: st-density
+
+gx <- seq(0, 8000, by = 200)
+gy <- seq(0, 8000, by = 200)
+gt <- seq(0, 112, by = 3)
+grid <- expand.grid(x = gx, y = gy, t = gt)
+
+h <- 700          # spatial bandwidth, m
+lam <- 14         # temporal bandwidth, days
+
+v <- numeric(nrow(grid))
+for (i in seq_len(nrow(cases))) {
+  v <- v + exp(-((grid$x - cases$x_utm[i])^2 + (grid$y - cases$y_utm[i])^2) / (2 * h^2)
+               - (grid$t - cases$day[i])^2 / (2 * lam^2))
+}
+v <- v / (2 * pi * h^2) / (sqrt(2 * pi) * lam) * 1e6 * 7   # cases per km^2 per week
+
+lv <- as.numeric(quantile(v, c(0.80, 0.92, 0.985)))
+c(cells = length(v), max = max(v), levels = lv)
+```
+
+Three nested shells at those levels: an outer envelope, a middle surface, and an
+opaque core. `caps` off so the volume is open at the box faces, and explicit
+lighting --- without it the shells read as flat silhouettes rather than as
+surfaces.
+
+```{r}
+#| label: isosurface
+
+shell <- function(level, opacity, colour) {
+  list(type = "isosurface",
+       x = grid$x, y = grid$y, z = grid$t, value = v,
+       isomin = level, isomax = max(v),
+       surface = list(count = 1, fill = 1),
+       caps = list(x = list(show = FALSE), y = list(show = FALSE),
+                   z = list(show = FALSE)),
+       opacity = opacity, showscale = FALSE,
+       colorscale = list(list(0, colour), list(1, colour)),
+       flatshading = FALSE,
+       lighting = list(ambient = 0.55, diffuse = 0.85, specular = 0.25,
+                       roughness = 0.5, fresnel = 0.2),
+       lightposition = list(x = 6000, y = -9000, z = 400))
+}
+
+cols <- c("#4a7fb5", "#e8873a", "#a01a1a")
+op   <- c(0.12, 0.28, 0.85)
+
+fig <- plot_ly()
+for (k in 1:3) fig <- do.call(add_trace, c(list(fig), shell(lv[k], op[k], cols[k])))
+
+fig |>
+  add_trace(data = cases, type = "scatter3d", mode = "markers",
+            x = ~x_utm, y = ~y_utm, z = ~day, hoverinfo = "skip",
+            marker = list(size = 1.4, color = "rgba(30,30,30,0.55)")) |>
+  layout(showlegend = FALSE,
+         scene = list(xaxis = list(title = "x (m)"),
+                      yaxis = list(title = "y (m)"),
+                      zaxis = list(title = "day of study"),
+                      aspectmode = "manual",
+                      aspectratio = list(x = 1, y = 1, z = 0.85),
+                      camera = list(eye = list(x = 1.6, y = -1.7, z = 0.7))))
+```
+
+To drop the grey panes and grid lines behind the volume, add
+`showbackground = FALSE, showgrid = FALSE` to each axis in `scene`. Keeping them
+gives the eye something to judge position against; removing them looks cleaner.
+
+The events themselves are drawn on top, as faint dust --- 1.4 px, 55% opaque.
+They are almost invisible individually, which is the point: inside the shells
+they crowd together, outside them they thin to a scatter, so the shells are
+visibly *a summary of the points* rather than a shape drawn over them. It is the
+quickest way to answer the question a student is right to ask, which is where the
+cloud came from.
+
+The structures now have surfaces. The outer envelope encloses an **inclined
+tube** climbing from the southwest to the northeast --- the hotspot advancing
+through the city --- and, standing beside it, a **vertical column** rooted at one
+location and running the full height of the box. The core sits inside the tube
+only: the travelling outbreak reaches intensities the endemic pocket never does.
+
+For a cloud-like rendering of the same field, a single `volume` trace draws many
+semi-transparent shells instead of three, with three orthogonal slice planes
+through the interior:
+
+```{r}
+#| label: volume
+
+plot_ly() |>
+  add_trace(type = "volume",
+            x = grid$x, y = grid$y, z = grid$t, value = v,
+            isomin = as.numeric(quantile(v, 0.75)), isomax = max(v),
+            opacity = 0.08, surface = list(count = 20),
+            slices = list(z = list(show = TRUE, locations = c(30, 60, 90))),
+            caps = list(x = list(show = FALSE), y = list(show = FALSE),
+                        z = list(show = FALSE)),
+            colorscale = "YlOrRd") |>
+  layout(scene = list(aspectmode = "manual",
+                      aspectratio = list(x = 1, y = 1, z = 0.85),
+                      zaxis = list(title = "day of study")))
+```
+
+**Question 4.** You have now made three choices the picture depends on: `h`,
+`lam`, and the levels. Re-render with the levels at the 95th and the 70th
+percentile. At which one does the endemic column disappear, and what does that
+tell you about reporting a hotspot as an object with a boundary?
+
+::: {.callout-warning}
+## Two practical limits
+**Points inside an opaque shell.** The innermost shell is at opacity 0.85 rather
+than 1 so the dust inside it still shows through. At 1 the core renders solid and
+the densest events --- the ones that matter most --- disappear behind it.
+
+**Grid size.** Each isosurface trace ships `x`, `y`, `z` and `value` to the
+browser, so a 200 m / 3-day grid is already about 64,000 cells per trace and
+three traces make a heavy page. Halving the spacing multiplies that by eight. Go
+finer for a figure you export, not for a page you publish.
+
+**plotly.js version.** `isosurface` and `volume` need a recent build; on an older
+one the plot returns empty. The alternative is `misc3d::contour3d()` through
+`rgl`, which renders smoother surfaces and is the better route for a
+high-resolution still:
+
+```r
+A <- array(v, dim = c(length(gx), length(gy), length(gt)))
+misc3d::contour3d(A, level = lv, x = gx, y = gy, z = gt,
+                  color = cols, alpha = c(0.12, 0.3, 1), smooth = TRUE)
+```
+:::
+
+---
+
+## 6. Is there space-time interaction? The Knox test (7 min)
+
+The cube is persuasive but it is not a test. The **Knox test** is the simplest
+one: fix a distance threshold and a time threshold, count the pairs of cases that
+are close on both, and compare that count with what you would get if the dates
+were shuffled.
+
+```{r}
+#| label: knox
+#| code-fold: false
+
+d0 <- 600     # metres
+t0 <- 14      # days
+
+Ds <- as.matrix(dist(cbind(cases$x_utm, cases$y_utm))) < d0
+Dt <- as.matrix(dist(cases$day)) < t0
+diag(Ds) <- FALSE; diag(Dt) <- FALSE
+
+knox_obs <- sum(Ds & Dt) / 2
+
+perm <- replicate(499, {
+  i <- sample(nrow(cases))
+  sum(Ds & Dt[i, i]) / 2
+})
+
+c(observed = knox_obs, null_mean = mean(perm),
+  p = (1 + sum(perm >= knox_obs)) / (1 + length(perm)))
+```
+
+```{r}
+#| label: knox-plot
+#| fig-height: 3.4
+
+ggplot(data.frame(perm = perm), aes(perm)) +
+  geom_histogram(bins = 30, fill = "grey80", colour = "white") +
+  geom_vline(xintercept = knox_obs, colour = "firebrick", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "close pairs under permuted dates", y = "",
+       subtitle = "red = observed")
+```
+
+Permuting the dates destroys any link between where a case was and when, while
+keeping both marginal distributions exactly as observed. That is the right null
+for this question: it is a test of *interaction*, not of spatial clustering.
+
+**Question 5.** The two thresholds were chosen by me. Change `d0` and `t0` --- try
+300 m / 7 days and 1500 m / 42 days --- and re-run. Does the conclusion hold?
+What does that tell you about a test that requires you to pick two numbers, and
+which method from Wednesday avoids the choice?
+
+---
+
+## 7. Drawing the links (6 min)
+
+The Knox count is a number; the pairs behind it are objects you can draw. Pick a
+distance and a time threshold, join every pair of cases that is close on both,
+and look at what the links connect.
+
+```{r}
+#| label: link-pairs
+#| code-fold: false
+
+d0 <- 600     # metres  -- change these two
+t0 <- 14      # days
+
+Ds <- as.matrix(dist(cbind(cases$x_utm, cases$y_utm))) < d0
+Dt <- as.matrix(dist(cases$day)) < t0
+
+pairs <- which(Ds & Dt & upper.tri(Ds), arr.ind = TRUE)
+nrow(pairs)                                  # = the Knox count
+```
+
+```{r}
+#| label: link-map
+#| fig-width: 6
+#| fig-height: 6
+
+seg <- data.frame(x    = cases$x_utm[pairs[, 1]], y    = cases$y_utm[pairs[, 1]],
+                  xend = cases$x_utm[pairs[, 2]], yend = cases$y_utm[pairs[, 2]])
+
+ggplot() +
+  geom_segment(data = seg, aes(x, y, xend = xend, yend = yend),
+               colour = "steelblue", alpha = 0.25, linewidth = 0.3) +
+  geom_point(data = cases, aes(x_utm, y_utm), colour = "firebrick",
+             size = 0.8, alpha = 0.8) +
+  coord_equal() + theme_minimal() +
+  labs(title = paste0("Cases linked within ", d0, " m and ", t0, " days"),
+       x = "x (m)", y = "y (m)")
+```
+
+The same links in the cube, where the slope of a link carries information the map
+throws away --- a near-horizontal link joins two cases days apart in the same
+place, a steep one joins cases weeks apart:
+
+```{r}
+#| label: link-cube
+
+edges <- data.frame(
+  x = as.vector(rbind(cases$x_utm[pairs[, 1]], cases$x_utm[pairs[, 2]], NA)),
+  y = as.vector(rbind(cases$y_utm[pairs[, 1]], cases$y_utm[pairs[, 2]], NA)),
+  z = as.vector(rbind(cases$day[pairs[, 1]],   cases$day[pairs[, 2]],   NA)))
+
+plot_ly() |>
+  add_trace(data = edges, type = "scatter3d", mode = "lines",
+            x = ~x, y = ~y, z = ~z, hoverinfo = "skip",
+            line = list(width = 1.2, color = "rgba(70,110,170,0.35)")) |>
+  add_trace(data = cases, type = "scatter3d", mode = "markers",
+            x = ~x_utm, y = ~y_utm, z = ~day,
+            marker = list(size = 2.5, color = "firebrick", opacity = 0.8)) |>
+  layout(showlegend = FALSE,
+         scene = list(xaxis = list(title = "x (m)"),
+                      yaxis = list(title = "y (m)"),
+                      zaxis = list(title = "day of study"),
+                      aspectmode = "manual",
+                      aspectratio = list(x = 1, y = 1, z = 0.85)))
+```
+
+Chains of links form connected components, which is as close as this kind of data
+gets to a candidate transmission chain:
+
+```{r}
+#| label: components
+#| code-fold: false
+
+g <- igraph::graph_from_edgelist(pairs, directed = FALSE)
+g <- igraph::add_vertices(g, nrow(cases) - igraph::vcount(g))
+comp <- igraph::components(g)
+
+c(components = comp$no, largest = max(comp$csize),
+  singletons = sum(comp$csize == 1))
+```
+
+At 600 m and 14 days expect two large components --- one strung along the
+travelling outbreak, one sitting on the endemic pocket --- and a long tail of
+isolated cases. Tighten to 300 m and 7 days and the large component fragments;
+loosen to 1500 m and 42 days and the whole dataset collapses into a single
+component, which tells you nothing.
+
+**Question 6.** A link means two cases were close in space and close in time. Name
+two reasons a linked pair might have nothing to do with each other, and one thing
+you would need in order to claim transmission. Then decide whether you would show
+this figure to a health officer at all.
+
+::: {.callout-warning}
+The picture is seductive and the inference is weak. Linkage graphs like this are
+sometimes presented as transmission networks; they are a *thresholded proximity*
+graph, and with a common source, a shared water tank or simply dense population
+they will draw links between cases that never infected one another. The graph is
+a hypothesis generator, and the two thresholds are yours, not the disease's.
+:::
+
+---
+
+## Takeaways
+
+1. Pooling over time turns a moving hotspot into a static band. Almost every
+   published hotspot map has this problem somewhere in it.
+2. Slice with one bandwidth and one colour scale, or you are comparing your own
+   rendering choices rather than the data.
+3. A vertical column in the cube and an inclined tube demand different
+   responses: endemic transmission versus an outbreak with a direction. The
+   pooled map shows neither.
+4. An isosurface gives a hotspot a boundary, and that boundary is an artefact of
+   three choices: `h`, `lam` and the level. Rotate and re-level before believing
+   a shape.
+5. Knox tests interaction, not clustering, because permuting dates preserves both
+   marginals. It costs you two arbitrary thresholds; the space-time $K$ function
+   is the version that scans over them.
+6. Drawing the Knox pairs makes the statistic concrete and the over-claim easy: a
+   proximity graph is not a transmission network.
+
+Exercise 3 asks you to do all of this on a different dataset, plus the
+space-time $K$ function itself.
